@@ -1,0 +1,6 @@
+# Identification de la webcam USB par son modelID UVC (AVFoundation) et lecture
+# des modes video qu'elle declare (CoreMedia).
+# La capture, la mise a l'echelle et la compression JPEG sont faites par ffmpeg
+# (brew install ffmpeg), pas par Python.
+pyobjc-framework-AVFoundation>=10.3
+pyobjc-framework-CoreMedia>=10.3

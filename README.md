@@ -10,14 +10,14 @@ fait **par nom de périphérique**, jamais par index.
 
 ## Pourquoi deux morceaux
 
-Docker Desktop sur macOS exécute les conteneurs dans une VM Linux qui **n'a pas accès aux
-périphériques USB** : il n'existe pas de `/dev/video0` à passer au conteneur. Le découpage est donc :
+Docker Desktop (macOS comme Windows) exécute les conteneurs dans une VM Linux qui **n'a pas accès
+aux périphériques USB** : il n'existe pas de `/dev/video0` à passer au conteneur. Le découpage est donc :
 
 ```
-┌─ hôte macOS ──────────────────┐        ┌─ conteneur Docker ─────────────┐
+┌─ hôte macOS / Windows ────────┐        ┌─ conteneur Docker ─────────────┐
 │ webcam USB (OASIS SP_ZOO)     │        │                                │
 │   └─ host/capture.py          │ MJPEG  │  detector/detect.py            │
-│       ffmpeg avfoundation     ├───────►│   YOLO Ultralytics (CPU)       │
+│       ffmpeg avfound./dshow   ├───────►│   YOLO Ultralytics (CPU)       │
 │       redim. + JPEG q70       │  HTTP  │   → détections en console      │
 │       serveur :8088           │  :8088 │                                │
 └───────────────────────────────┘        └────────────────────────────────┘
@@ -29,8 +29,9 @@ La compression se fait côté hôte : 1080p brut à 30 fps ≈ 90 Mo/s, le flux 
 ## Prérequis
 
 - Docker Desktop (testé avec le moteur 29.x, linux/arm64)
-- Python 3.12 sur l'hôte (`brew install python@3.12`)
-- ffmpeg sur l'hôte (`brew install ffmpeg`) — c'est lui qui capture
+- Python 3.12 sur l'hôte — macOS : `brew install python@3.12` ; Windows : `winget install Python.Python.3.12`
+- ffmpeg sur l'hôte, dans le `PATH` — macOS : `brew install ffmpeg` ; Windows :
+  `winget install Gyan.FFmpeg` — c'est lui qui capture
 - La webcam USB branchée
 
 ## Installation
@@ -72,6 +73,21 @@ Côté capture, une ligne de débit toutes les 5 s :
 `make down` supprime le conteneur, `Ctrl-C` arrête la capture. Pour voir l'image plutôt que la
 console : `make preview`.
 
+### Windows
+
+Le Makefile fonctionne depuis Git Bash si `make` est installé (`winget install ezwinports.make`).
+Sinon, depuis PowerShell :
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r host\requirements.txt   # rien d'obligatoire sous Windows
+.venv\Scripts\python host\capture.py --list                    # = make cameras
+.venv\Scripts\python host\capture.py                           # = make capture
+```
+
+Au premier lancement, le pare-feu Windows demande d'autoriser Python sur le réseau : accepte
+(réseaux privés), sinon le conteneur ne joint pas le port 8088.
+
 ### Sans le Makefile
 
 ```bash
@@ -82,7 +98,13 @@ docker run --rm -it --init -p 8089:8089 \
   human-detection-ia/detector
 ```
 
-### Autorisation caméra (macOS)
+### Autorisation caméra
+
+**Windows** : Paramètres → Confidentialité et sécurité → Caméra → « Autoriser les applications de
+bureau à accéder à votre caméra ». Un refus (ou une webcam occupée par une autre application) se
+traduit par `Could not run graph` côté ffmpeg, et le même message `refuse de s'ouvrir`.
+
+**macOS** :
 
 Au premier `make capture`, macOS demande l'accès à la caméra **pour l'application qui lance la
 commande**. Lance-le depuis Terminal.app ou iTerm et accepte. Si tu l'as refusé une fois :
@@ -110,14 +132,38 @@ make cameras
 #   -> 1920x1080 @ 30 fps
 ```
 
-Deux étapes, et **aucun index** :
+Deux étapes, et **aucun index**.
+
+macOS :
 
 1. AVFoundation donne le `modelID` de chaque source vidéo. Une webcam USB de classe UVC s'annonce
    `UVC Camera VendorID_… ProductID_…` ; tout ce qui ne correspond pas à ce motif est écarté.
 2. Le nom de la webcam retenue est confronté à l'énumération de ffmpeg, puis passé à ffmpeg
    **par ce nom**.
 
-Pourquoi pas un index : les indices de périphériques vidéo sur macOS se décalent au gré des
+Windows :
+
+1. ffmpeg énumère les périphériques DirectShow. Seuls ceux dont le nom alternatif contient un
+   chemin USB (`@device_pnp_\\?\usb#vid_32e6&pid_9221…`) sont retenus : caméras virtuelles (OBS…)
+   et caméras non USB sont écartées.
+2. Beaucoup de webcams de portable sont branchées en USB *à l'intérieur* du PC. Windows marque
+   ces périphériques comme intégrés (`DEVPKEY_Device_InLocalMachineContainer`, lu via
+   PowerShell) : ils sont écartés aussi. Si PowerShell ne répond pas, la capture le signale et ne
+   contrôle plus que le chemin USB.
+3. ffmpeg reçoit le **nom alternatif**, unique par périphérique : deux webcams de même nom ne se
+   confondent pas. Les modes sont lus avec `ffmpeg -f dshow -list_options` ; à taille égale, le
+   MJPEG du capteur est préféré au brut (moins de bande passante USB).
+
+```
+webcam USB utilisee : USB Camera  [USB VID_32E6 PID_9221]
+identifiant ffmpeg  : @device_pnp_\\?\usb#vid_32e6&pid_9221&mi_00#…\global
+modes declares par le capteur :
+     320x240 @ 30 fps  (yuyv422)
+  -> 640x480 @ 30 fps  (mjpeg)
+     1920x1080 @ 30 fps  (mjpeg)
+```
+
+Pourquoi pas un index : les indices de périphériques vidéo se décalent au gré des
 branchements, et ils ne sont pas partagés entre bibliothèques — le même numéro ne désigne pas la
 même caméra d'un outil à l'autre. Un index hors liste fait silencieusement retomber certains
 backends sur le périphérique *par défaut* du système, ce qui ouvre la mauvaise caméra sans aucune
@@ -130,7 +176,7 @@ Si la webcam disparaît en cours de route, la capture attend son rebranchement p
 ### Résolution et cadence
 
 Le capteur n'accepte qu'une liste finie de combinaisons résolution/cadence ; lui en demander une
-autre fait échouer l'ouverture. La capture lit donc cette liste sur le périphérique (via CoreMedia)
+autre fait échouer l'ouverture. La capture lit donc cette liste sur le périphérique (CoreMedia sous macOS, DirectShow sous Windows)
 et retient **le plus grand mode qui tient dans `--width`/`--height`**, affiché au démarrage :
 
 ```
@@ -267,7 +313,7 @@ services:
     init: true
     restart: unless-stopped
     environment:
-      # host.docker.internal = la machine macOS qui publie le flux webcam USB
+      # host.docker.internal = la machine (macOS ou Windows) qui publie le flux webcam USB
       STREAM_URL: http://host.docker.internal:8088/stream
       YOLO_CONF: "0.35"
       YOLO_IMGSZ: "640"

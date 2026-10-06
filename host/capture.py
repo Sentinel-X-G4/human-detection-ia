@@ -3,10 +3,15 @@
 
 Seule une webcam USB est utilisable. La capture passe par ffmpeg, qui selectionne
 le peripherique *par son nom* : aucun index n'est utilise, car un index n'identifie
-pas de maniere fiable un peripherique video sur macOS.
+pas de maniere fiable un peripherique video.
 
-Tourne sur l'hote macOS, Docker Desktop n'ayant pas acces aux peripheriques USB.
-Le conteneur de detection consomme http://host.docker.internal:<port>/stream
+Tourne sur l'hote (macOS ou Windows), Docker Desktop n'ayant pas acces aux
+peripheriques USB. Le conteneur de detection consomme
+http://host.docker.internal:<port>/stream
+
+- macOS   : AVFoundation identifie la webcam (modelID UVC), ffmpeg -f avfoundation
+- Windows : DirectShow identifie la webcam (chemin usb#vid_…&pid_…, peripherique
+            non integre au PC), ffmpeg -f dshow
 """
 import argparse
 import re
@@ -21,10 +26,17 @@ BOUNDARY = "frameboundary"
 SOI = b"\xff\xd8"  # debut d'image JPEG
 EOI = b"\xff\xd9"  # fin d'image JPEG
 
+IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
+
 # Une webcam USB de classe UVC s'annonce avec ce prefixe de modelID
 # ("UVC Camera VendorID_13030 ProductID_37409" pour l'OASIS SP_ZOO).
 # Toute source video dont le modelID ne commence pas par ce prefixe est ecartee.
 UVC_MODEL_PREFIX = "uvc camera"
+
+# Sous Windows, le nom alternatif DirectShow d'une webcam USB contient son chemin
+# de peripherique : @device_pnp_\\?\usb#vid_32e6&pid_9221&mi_00#7&…#{guid}\global
+USB_PATH_RE = re.compile(r"\\\\\?\\(usb#vid_([0-9a-f]{4})&pid_([0-9a-f]{4})[^{]*)#\{", re.I)
 
 # Bruit emis par macOS a l'enumeration, sans rapport avec la webcam USB.
 FFMPEG_NOISE = ("nscamerausecontinuitycameradevicetype", "avcapturedevicetype")
@@ -33,6 +45,40 @@ FFMPEG_NOISE = ("nscamerausecontinuitycameradevicetype", "avcapturedevicetype")
 class NoUsbCamera(RuntimeError):
     """Aucune webcam USB exploitable n'est branchee."""
 
+
+def ffmpeg_bin():
+    path = shutil.which("ffmpeg")
+    if not path:
+        hint = "winget install Gyan.FFmpeg" if IS_WINDOWS else "brew install ffmpeg"
+        raise SystemExit(f"ffmpeg est introuvable. Installe-le : {hint}")
+    return path
+
+
+def choose_mode(modes, want_width, want_height):
+    """Le plus grand mode qui tient dans la taille demandee, sinon le plus petit.
+
+    Un mode est (largeur, hauteur, fps_max, options d'entree ffmpeg).
+    """
+    fitting = [m for m in modes if m[0] <= want_width and m[1] <= want_height]
+    if fitting:
+        return max(fitting, key=lambda m: m[0] * m[1])
+    return min(modes, key=lambda m: m[0] * m[1])
+
+
+def _single_camera(cameras):
+    """La seule webcam USB branchee, parmi [(nom, modelID, ...)]."""
+    if not cameras:
+        raise NoUsbCamera("webcam USB non detectee. Verifie le branchement USB.")
+    if len(cameras) > 1:
+        listing = "\n".join(f"  {c[0]}  [{c[1]}]" for c in cameras)
+        raise NoUsbCamera(
+            "plusieurs webcams USB branchees, debranche celles qui ne servent pas :\n"
+            + listing
+        )
+    return cameras[0]
+
+
+# -- macOS : AVFoundation ----------------------------------------------------
 
 def _usb_devices():
     """Objets AVCaptureDevice des webcams USB branchees."""
@@ -49,13 +95,8 @@ def _usb_devices():
     ]
 
 
-def usb_cameras():
-    """[(nom, modelID)] des webcams USB branchees."""
-    return [(str(d.localizedName()), str(d.modelID())) for d in _usb_devices()]
-
-
 def camera_modes(device):
-    """[(largeur, hauteur, fps_max)] que la webcam declare savoir produire.
+    """[(largeur, hauteur, fps_max, ())] que la webcam declare savoir produire.
 
     Le capteur n'accepte que ces combinaisons : lui demander autre chose fait
     echouer l'ouverture. On lit donc sa liste plutot que de supposer.
@@ -75,28 +116,11 @@ def camera_modes(device):
         dims = CM.CMVideoFormatDescriptionGetDimensions(fmt.formatDescription())
         key = (int(dims.width), int(dims.height))
         best[key] = max(best.get(key, 0.0), max(rates))
-    return sorted((w, h, fps) for (w, h), fps in best.items())
-
-
-def choose_mode(modes, want_width, want_height):
-    """Le plus grand mode qui tient dans la taille demandee, sinon le plus petit."""
-    fitting = [m for m in modes if m[0] <= want_width and m[1] <= want_height]
-    if fitting:
-        return max(fitting, key=lambda m: m[0] * m[1])
-    return min(modes, key=lambda m: m[0] * m[1])
-
-
-def ffmpeg_bin():
-    path = shutil.which("ffmpeg")
-    if not path:
-        raise SystemExit(
-            "ffmpeg est introuvable. Installe-le : brew install ffmpeg"
-        )
-    return path
+    return sorted((w, h, fps, ()) for (w, h), fps in best.items())
 
 
 def ffmpeg_device_names():
-    """Noms des peripheriques video tels que ffmpeg les enumere."""
+    """Noms des peripheriques video tels que ffmpeg -f avfoundation les enumere."""
     proc = subprocess.run(
         [ffmpeg_bin(), "-hide_banner", "-nostdin", "-f", "avfoundation",
          "-list_devices", "true", "-i", ""],
@@ -119,28 +143,15 @@ def ffmpeg_device_names():
     return names
 
 
-def resolve_usb_camera():
-    """Nom exact a passer a ffmpeg pour la webcam USB.
-
-    La webcam est identifiee par son modelID UVC via AVFoundation, puis son nom
+def _resolve_usb_camera_macos():
+    """La webcam est identifiee par son modelID UVC via AVFoundation, puis son nom
     est confronte a l'enumeration de ffmpeg : c'est ffmpeg qui ouvrira le
     peripherique, donc c'est sa vision des choses qui doit confirmer le choix.
-
-    Retourne (nom ffmpeg, modelID, modes supportes).
     """
     devices = _usb_devices()
-    if not devices:
-        raise NoUsbCamera("webcam USB non detectee. Verifie le branchement USB.")
-    if len(devices) > 1:
-        listing = "\n".join(
-            f"  {d.localizedName()}  [{d.modelID()}]" for d in devices
-        )
-        raise NoUsbCamera(
-            "plusieurs webcams USB branchees, debranche celles qui ne servent pas :\n"
-            + listing
-        )
-    device = devices[0]
-    name, model = str(device.localizedName()), str(device.modelID())
+    name, model, device = _single_camera(
+        [(str(d.localizedName()), str(d.modelID()), d) for d in devices]
+    )
     modes = camera_modes(device)
     if not modes:
         raise NoUsbCamera(
@@ -162,7 +173,154 @@ def resolve_usb_camera():
             f"le nom de la webcam USB ({name}) est ambigu pour ffmpeg : "
             "debranche le peripherique video en trop."
         )
-    return matches[0], model, modes
+    return matches[0], name, model, modes
+
+
+# -- Windows : DirectShow ----------------------------------------------------
+
+def _dshow_video_devices():
+    """[(nom, nom alternatif)] des peripheriques video vus par ffmpeg -f dshow.
+
+    Gere les deux formats d'enumeration de ffmpeg : sections "DirectShow video
+    devices" (ffmpeg < 5) et type entre parentheses sur chaque ligne (ffmpeg >= 5).
+    """
+    proc = subprocess.run(
+        [ffmpeg_bin(), "-hide_banner", "-nostdin", "-f", "dshow",
+         "-list_devices", "true", "-i", "dummy"],
+        capture_output=True, text=True, errors="replace",
+    )
+    devices = []
+    current = None
+    in_video = False
+    for line in proc.stderr.splitlines():
+        low = line.lower()
+        if "directshow video devices" in low:
+            in_video = True
+            continue
+        if "directshow audio devices" in low:
+            in_video = False
+            continue
+        alt = re.search(r'alternative name\s+"(.*)"', line, re.I)
+        if alt:
+            if current is not None:
+                current[1] = alt.group(1)
+            continue
+        dev = re.search(r'\]\s+"(.*)"(?:\s+\(([^)]*)\))?\s*$', line)
+        if not dev:
+            continue
+        kind = dev.group(2)
+        is_video = ("video" in kind.lower()) if kind is not None else in_video
+        current = [dev.group(1), None] if is_video else None
+        if current is not None:
+            devices.append(current)
+    return [(name, alt) for name, alt in devices if alt]
+
+
+def _instance_id(device_path):
+    """usb#vid_32e6&pid_9221&mi_00#7&abc&0&0000 -> USB\\VID_32E6&PID_9221&MI_00\\7&ABC&0&0000"""
+    return device_path.replace("#", "\\").upper()
+
+
+def _integrated_devices(instance_ids):
+    """Sous-ensemble des instance IDs que Windows declare integres au PC.
+
+    Beaucoup de webcams de portable sont branchees en USB a l'interieur de la
+    machine : seul le conteneur de peripherique (DEVPKEY_Device_InLocalMachineContainer)
+    distingue une webcam integree d'une webcam USB externe.
+    Retourne None si l'information est indisponible.
+    """
+    if not instance_ids:
+        return set()
+    ids = ",".join(f"'{i}'" for i in instance_ids)
+    script = (
+        f"foreach ($i in @({ids})) {{ "
+        "$p = Get-PnpDeviceProperty -InstanceId $i "
+        "-KeyName DEVPKEY_Device_InLocalMachineContainer -ErrorAction SilentlyContinue; "
+        "\"$i|$($p.Data)\" }"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, errors="replace", timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    integrated = set()
+    for line in proc.stdout.splitlines():
+        iid, _, value = line.strip().partition("|")
+        if value.strip().lower() == "true":
+            integrated.add(iid.upper())
+    return integrated
+
+
+def _dshow_modes(alt_name):
+    """[(largeur, hauteur, fps_max, options d'entree)] declares par la webcam.
+
+    A taille egale, garde la cadence la plus haute, puis MJPEG : le capteur
+    compresse lui-meme, ce qui menage la bande passante USB en haute resolution.
+    """
+    proc = subprocess.run(
+        [ffmpeg_bin(), "-hide_banner", "-nostdin", "-f", "dshow",
+         "-list_options", "true", "-i", f"video={alt_name}"],
+        capture_output=True, text=True, errors="replace",
+    )
+    best = {}
+    pattern = re.compile(
+        r"(vcodec|pixel_format)=(\S+)\s+min s=\d+x\d+ fps=[\d.]+\s+"
+        r"max s=(\d+)x(\d+) fps=([\d.]+)"
+    )
+    for line in proc.stderr.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        kind, value, width, height, rate = match.groups()
+        opts = ("-vcodec", value) if kind == "vcodec" else ("-pixel_format", value)
+        key = (int(width), int(height))
+        rank = (float(rate), opts == ("-vcodec", "mjpeg"))
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, opts)
+    return sorted((w, h, rank[0], opts) for (w, h), (rank, opts) in best.items())
+
+
+def _resolve_usb_camera_windows():
+    """La webcam est identifiee par son chemin de peripherique USB, que DirectShow
+    expose dans le nom alternatif. Ce nom alternatif est unique : c'est lui qui
+    est passe a ffmpeg, si bien que deux webcams de meme nom ne se confondent pas.
+    """
+    candidates = []
+    for name, alt in _dshow_video_devices():
+        match = USB_PATH_RE.search(alt)
+        if match:
+            path, vid, pid = match.groups()
+            candidates.append((name, f"USB VID_{vid.upper()} PID_{pid.upper()}",
+                               alt, _instance_id(path)))
+
+    integrated = _integrated_devices([c[3] for c in candidates])
+    if integrated is None:
+        print("[capture] impossible de verifier via PowerShell si la webcam est "
+              "integree au PC : seul le chemin USB est controle.", flush=True)
+    else:
+        candidates = [c for c in candidates if c[3] not in integrated]
+
+    name, model, alt, _ = _single_camera(candidates)
+    modes = _dshow_modes(alt)
+    if not modes:
+        raise NoUsbCamera(
+            f"la webcam USB ({name} [{model}]) ne declare aucun mode video exploitable.\n"
+            "Rebranche-la, puis verifie avec : "
+            f"ffmpeg -f dshow -list_options true -i \"video={alt}\""
+        )
+    return alt, name, model, modes
+
+
+def resolve_usb_camera():
+    """Identifiant ffmpeg de la webcam USB.
+
+    Retourne (identifiant passe a ffmpeg, nom lisible, modelID, modes supportes).
+    """
+    if IS_WINDOWS:
+        return _resolve_usb_camera_windows()
+    return _resolve_usb_camera_macos()
 
 
 def jpeg_quality_to_qscale(quality):
@@ -194,13 +352,19 @@ class FfmpegSource:
     # -- lancement de ffmpeg ------------------------------------------------
 
     def _command(self, device, mode):
-        width, height, rate = mode
-        cmd = [ffmpeg_bin(), "-hide_banner", "-nostdin", "-loglevel", "warning",
-               "-f", "avfoundation",
-               # arrondi : ffmpeg tolere un ecart de 0.01 fps sur le mode du capteur
-               "-framerate", f"{round(rate, 3):g}",
-               "-video_size", f"{width}x{height}",
-               "-i", device]
+        width, height, rate, input_opts = mode
+        cmd = [ffmpeg_bin(), "-hide_banner", "-nostdin", "-loglevel", "warning"]
+        if IS_WINDOWS:
+            # tampon temps reel plus large : evite les images jetees au demarrage
+            cmd += ["-f", "dshow", "-rtbufsize", "64M", *input_opts]
+            source = f"video={device}"
+        else:
+            cmd += ["-f", "avfoundation", *input_opts]
+            source = device
+        # arrondi : ffmpeg tolere un ecart de 0.01 fps sur le mode du capteur
+        cmd += ["-framerate", f"{round(rate, 3):g}",
+                "-video_size", f"{width}x{height}",
+                "-i", source]
         filters = []
         # la cadence de publication se regle apres coup : le capteur n'expose
         # souvent qu'une seule cadence, on jette les images en trop ici
@@ -244,7 +408,7 @@ class FfmpegSource:
         failures = 0
         while not self._stop.is_set():
             try:
-                device, model, modes = resolve_usb_camera()
+                device, name, model, modes = resolve_usb_camera()
             except NoUsbCamera as exc:
                 print(f"[capture] {exc}", flush=True)
                 print("[capture] attente de la webcam USB...", flush=True)
@@ -253,8 +417,8 @@ class FfmpegSource:
                 continue
 
             mode = choose_mode(modes, self.want_width, self.want_height)
-            width, height, rate = mode
-            print(f"[capture] webcam USB : {device} [{model}]", flush=True)
+            width, height, rate, _ = mode
+            print(f"[capture] webcam USB : {name} [{model}]", flush=True)
             print(
                 f"[capture] mode retenu : {width}x{height} @ {rate:.0f} fps"
                 + (f", publie a {self.publish_fps:g} fps"
@@ -276,11 +440,16 @@ class FfmpegSource:
                 failures += 1
 
             if frames == 0 and self._not_authorized(errors):
+                if IS_WINDOWS:
+                    permission = ("autorise les applications de bureau dans Parametres > "
+                                  "Confidentialite et securite > Camera")
+                else:
+                    permission = ("autorise ton terminal dans Reglages Systeme > "
+                                  "Confidentialite et securite > Camera")
                 print(
-                    f"[capture] la webcam USB ({device}) a ete trouvee mais refuse de "
+                    f"[capture] la webcam USB ({name}) a ete trouvee mais refuse de "
                     "s'ouvrir.\n"
-                    "  - autorise ton terminal dans Reglages Systeme > Confidentialite "
-                    "et securite > Camera,\n"
+                    f"  - {permission},\n"
                     "  - ou ferme l'application qui occupe deja la webcam,\n"
                     "puis relance la capture.",
                     flush=True,
@@ -323,17 +492,22 @@ class FfmpegSource:
     @staticmethod
     def _mode_rejected(errors):
         joined = "\n".join(errors).lower()
-        return "supported modes" in joined or "selected framerate" in joined
+        return ("supported modes" in joined or "selected framerate" in joined
+                or "could not set video options" in joined)
 
     @staticmethod
     def _not_authorized(errors):
         # ffmpeg a trouve le peripherique mais n'a pas pu l'ouvrir : permission
-        # macOS refusee, ou webcam deja occupee par une autre application.
-        return any("cannot use" in line.lower() for line in errors)
+        # refusee, ou webcam deja occupee par une autre application.
+        # macOS : "Cannot use <nom>" ; Windows : "Could not run graph".
+        return any("cannot use" in line.lower() or "could not run graph" in line.lower()
+                   for line in errors)
 
     @staticmethod
     def _device_vanished(errors):
-        return any("video device not found" in line.lower() for line in errors)
+        # macOS : "Video device not found" ; Windows : "Could not find video device"
+        return any("video device not found" in line.lower()
+                   or "could not find video device" in line.lower() for line in errors)
 
     def _pump(self, proc):
         """Decoupe le flux JPEG de ffmpeg et publie chaque image."""
@@ -486,18 +660,27 @@ def main():
                    help="affiche la webcam USB detectee et quitte")
     args = p.parse_args()
 
+    if not (IS_MAC or IS_WINDOWS):
+        print(f"[capture] plateforme non prise en charge : {sys.platform} "
+              "(macOS ou Windows uniquement)", file=sys.stderr)
+        return 1
+
     if args.list:
         try:
-            device, model, modes = resolve_usb_camera()
+            device, name, model, modes = resolve_usb_camera()
         except NoUsbCamera as exc:
             print(exc)
             return 1
         chosen = choose_mode(modes, args.width, args.height)
-        print(f"webcam USB utilisee : {device}  [{model}]")
+        print(f"webcam USB utilisee : {name}  [{model}]")
+        if device != name:
+            print(f"identifiant ffmpeg  : {device}")
         print("modes declares par le capteur :")
-        for width, height, rate in modes:
-            mark = "->" if (width, height, rate) == chosen else "  "
-            print(f"  {mark} {width}x{height} @ {rate:.0f} fps")
+        for mode in modes:
+            width, height, rate, input_opts = mode
+            mark = "->" if mode == chosen else "  "
+            fmt = f"  ({input_opts[1]})" if input_opts else ""
+            print(f"  {mark} {width}x{height} @ {rate:.0f} fps{fmt}")
         return 0
 
     try:

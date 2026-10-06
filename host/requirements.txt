@@ -1,6 +1,7 @@
-# Identification de la webcam USB par son modelID UVC (AVFoundation) et lecture
-# des modes video qu'elle declare (CoreMedia).
+# macOS : identification de la webcam USB par son modelID UVC (AVFoundation) et
+# lecture des modes video qu'elle declare (CoreMedia).
+# Windows : rien a installer, DirectShow et PowerShell suffisent.
 # La capture, la mise a l'echelle et la compression JPEG sont faites par ffmpeg
-# (brew install ffmpeg), pas par Python.
-pyobjc-framework-AVFoundation>=10.3
-pyobjc-framework-CoreMedia>=10.3
+# (brew install ffmpeg / winget install Gyan.FFmpeg), pas par Python.
+pyobjc-framework-AVFoundation>=10.3; sys_platform == "darwin"
+pyobjc-framework-CoreMedia>=10.3; sys_platform == "darwin"

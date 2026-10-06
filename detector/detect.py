@@ -4,9 +4,13 @@
 Les resultats sont affiches dans la console, et visibles annotes sur
 http://localhost:<PREVIEW_PORT>/ si le port est publie.
 
-Si MQTT_HOST est defini, la presence d'une personne est publiee sur
-sentinelx/{device_id}/camera ({"ts": ms, "person": bool}) a destination du
-service de detection, qui la combine aux capteurs de l'ESP de la meme piece.
+Chaque personne detectee passe par la reconnaissance faciale (faces.py) : l'etat
+d'identite vaut "none" (personne), "authorized" (personne autorisee) ou "unknown"
+(inconnu). Les visages autorises se gerent par l'API interne (FACES_API_PORT).
+
+Si MQTT_HOST est defini, la presence et l'identite sont publiees sur
+sentinelx/{device_id}/camera ({"ts", "person", "identity", "names"}) a destination
+du service de detection, qui combine `person` aux capteurs de l'ESP de la piece.
 """
 import json
 import os
@@ -25,6 +29,8 @@ import numpy as np
 import paho.mqtt.client as mqtt
 from ultralytics import YOLO
 
+import faces
+
 STREAM_URL = os.environ.get("STREAM_URL", "http://host.docker.internal:8088/stream")
 MODEL = os.environ.get("YOLO_MODEL", "yolo11n.pt")
 CONF = float(os.environ.get("YOLO_CONF", "0.35"))
@@ -37,6 +43,8 @@ MAX_FPS = float(os.environ.get("MAX_FPS", "0"))  # 0 = aussi vite que possible
 PRINT_EMPTY = os.environ.get("PRINT_EMPTY", "0") == "1"
 PREVIEW_PORT = int(os.environ.get("PREVIEW_PORT", "8089"))  # 0 = desactive
 PREVIEW_QUALITY = int(os.environ.get("PREVIEW_QUALITY", "75"))
+FACE_ENABLED = os.environ.get("FACE_ENABLED", "1") == "1"
+PERSON_CLASS = 0  # COCO
 
 # Publication MQTT (contrat : backend-iot-alerts/detection-service/docs/MQTT_CONTRACT.md)
 MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()  # vide = desactive
@@ -292,7 +300,7 @@ class CameraPublisher:
 
     def __init__(self):
         self.topic = MQTT_TOPIC.format(device_id=MQTT_DEVICE_ID)
-        self._last_person = None
+        self._last_state = None
         self._last_sent = 0.0
         self._client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
@@ -330,21 +338,29 @@ class CameraPublisher:
         if not _stop.is_set():
             print(f"[mqtt] deconnecte ({reason_code}), reconnexion...", flush=True)
 
-    def update(self, person):
-        """A appeler pour chaque image analysee."""
+    def update(self, person, identity=None, names=()):
+        """A appeler pour chaque image analysee.
+
+        `identity` et `names` sont des champs supplementaires, ignores par le
+        service de detection (qui n'exploite que `person`).
+        """
         now = time.monotonic()
-        changed = person != self._last_person
+        state = (person, identity, tuple(names))
+        changed = state != self._last_state
         if not changed and now - self._last_sent < MQTT_INTERVAL:
             return
         if not self._client.is_connected():
             return
-        payload = json.dumps({"ts": int(time.time() * 1000), "person": person})
-        info = self._client.publish(self.topic, payload, qos=0)
+        message = {"ts": int(time.time() * 1000), "person": person}
+        if identity is not None:
+            message.update(identity=identity, names=list(names))
+        info = self._client.publish(self.topic, json.dumps(message), qos=0)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             return
         if changed:
-            print(f"[mqtt] person={'true' if person else 'false'}", flush=True)
-        self._last_person = person
+            extra = f" identity={identity}" if identity is not None else ""
+            print(f"[mqtt] person={'true' if person else 'false'}{extra}", flush=True)
+        self._last_state = state
         self._last_sent = now
 
 
@@ -389,6 +405,23 @@ def main():
     preview = Preview(PREVIEW_PORT)
     preview.start()
 
+    latest = {"frame": None}   # derniere image decodee, pour l'enregistrement depuis la camera
+    if FACE_ENABLED:
+        face_engine = faces.FaceEngine()
+        face_store = faces.FaceStore(faces.FACES_DIR)
+        tracker = faces.IdentityTracker()
+        faces_api = faces.FacesApi(
+            faces.FACES_API_PORT, face_store, tracker,
+            lambda: None if latest["frame"] is None else latest["frame"].copy(), _stop,
+        )
+        faces_api.start()
+        print(f"[faces] {len(face_store.list())} visage(s) autorise(s) | "
+              f"seuil={faces.FACE_MATCH_THRESHOLD} | taille min={faces.FACE_MIN_SIZE}px",
+              flush=True)
+    else:
+        tracker = faces_api = None
+        print("[faces] FACE_ENABLED=0 : reconnaissance faciale desactivee", flush=True)
+
     publisher = CameraPublisher() if MQTT_HOST else None
     if publisher:
         publisher.start()
@@ -415,6 +448,7 @@ def main():
         frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             continue
+        latest["frame"] = frame
 
         last_run = time.monotonic()
         t0 = time.perf_counter()
@@ -426,21 +460,38 @@ def main():
         frames += 1
         infer_total += infer_ms
 
+        boxes = result.boxes
+        counts = Counter(names[int(c)] for c in boxes.cls.tolist()) if len(boxes) else Counter()
+        stamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S.%f")[:-3]
+
+        seen_faces = []
+        if tracker:
+            person_boxes = [xyxy for xyxy, cls in zip(boxes.xyxy.tolist(), boxes.cls.tolist())
+                            if int(cls) == PERSON_CLASS]
+            seen_faces, faceless = faces.identify(face_engine, face_store, frame, person_boxes)
+            if tracker.update(len(person_boxes), seen_faces, faceless):
+                state = tracker.status()
+                who = f" ({', '.join(state['names'])})" if state["names"] else ""
+                print(f"{stamp} | identite : {state['identity']}{who}", flush=True)
+
         if preview.watched:
+            image = result.plot()
+            if seen_faces:
+                faces.annotate(image, seen_faces)
             ok, buf = cv2.imencode(
-                ".jpg", result.plot(),
+                ".jpg", image,
                 [int(cv2.IMWRITE_JPEG_QUALITY), PREVIEW_QUALITY],
             )
             if ok:
                 preview.publish(buf.tobytes())
 
-        boxes = result.boxes
-        counts = Counter(names[int(c)] for c in boxes.cls.tolist()) if len(boxes) else Counter()
-        stamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S.%f")[:-3]
-
         if publisher:
             # seule la classe person compte, meme si YOLO_CLASSES en suit d'autres
-            publisher.update("person" in counts)
+            if tracker:
+                state = tracker.status()
+                publisher.update("person" in counts, state["identity"], state["names"])
+            else:
+                publisher.update("person" in counts)
 
         if counts:
             summary = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
@@ -471,6 +522,8 @@ def main():
             window_start = time.monotonic()
 
     preview.stop()
+    if faces_api:
+        faces_api.stop()
     if publisher:
         publisher.stop()
     print("[detect] arret", flush=True)

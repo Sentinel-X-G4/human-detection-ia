@@ -16,6 +16,7 @@ IMAGE := human-detection-ia/detector
 NAME := human-detector
 CPUS ?= 4
 PREVIEW_PORT ?= 8089
+FACES_API_PORT ?= 8090
 
 setup: $(PY) ## Installe les dependances de capture sur l'hote
 	@command -v ffmpeg >/dev/null || { echo "ffmpeg manquant : brew install ffmpeg (macOS) / winget install Gyan.FFmpeg (Windows)"; exit 1; }
@@ -40,6 +41,8 @@ up: ## Demarre le detecteur et suit les logs
 	docker run -d --name $(NAME) --init --restart unless-stopped \
 		--cpus $(CPUS) \
 		-p $(PREVIEW_PORT):8089 \
+		-p 127.0.0.1:$(FACES_API_PORT):8090 \
+		-v $(NAME)-faces:/data \
 		--add-host host.docker.internal:host-gateway \
 		$(IMAGE)
 	docker logs -f $(NAME)

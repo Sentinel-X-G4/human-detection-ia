@@ -221,6 +221,65 @@ curl -s http://localhost:8088/health    # {"status":"ok","camera":"usb"}
 C'est celui à regarder pour vérifier le cadrage ou l'identité de la caméra : il ne dépend pas du
 conteneur.
 
+## Reconnaissance faciale
+
+Chaque personne détectée par YOLO passe par deux modèles OpenCV (ONNX, téléchargés et vérifiés
+par SHA-256 au build) : **YuNet** trouve les visages, **SFace** en calcule une empreinte de 128
+valeurs, comparée aux visages autorisés (similarité cosinus ≥ `FACE_MATCH_THRESHOLD`).
+
+Sortie : un état d'identité unique, publié en MQTT, servi par l'API et affiché en console.
+
+| `identity` | quand |
+|---|---|
+| `none` | aucune personne depuis `NONE_HOLD_S` (1,5 s) |
+| `authorized` | tous les visages visibles sont autorisés — ou personne de dos/trop loin, si un visage autorisé a été vu il y a moins de `FACE_HOLD_S` (5 s) |
+| `unknown` | un visage non autorisé est vu (confirmé sur `UNKNOWN_FRAMES` images s'il y avait une personne autorisée), ou personne sans visage visible ni autorisé récent |
+
+```
+16:02:11.204 | identite : authorized (Alice)
+16:02:30.871 | identite : unknown
+16:02:41.115 | identite : none
+```
+
+Un visage hors de toute personne détectée (photo, écran) est ignoré. Sous `FACE_MIN_SIZE`
+(40 px), un visage est trop petit pour être reconnu : à 640 px de large, il faut être à
+quelques mètres de la caméra au plus. La prévisualisation (`make preview`) entoure les visages
+reconnus en vert (nom + score), les inconnus en rouge.
+
+Mesures (photos de test OpenCV) : même personne en miroir, réduite, assombrie ou très
+compressée → 0,91 à 0,97 ; autre personne → 0,20. Seuil par défaut : 0,363.
+
+### Visages autorisés
+
+Gérés par une **API interne** (port `FACES_API_PORT`, 8090), protégée par `VISION_API_KEY`
+et jamais publiée : dans la pile Sentinel-X, le dashboard passe par le backend-api
+(`GET/POST /api/v1/faces`, `DELETE /api/v1/faces/:id`, `GET /api/v1/camera` — voir son README).
+
+| Route interne | Rôle |
+|---|---|
+| `GET /status` | `{identity, person, names, faces: [{name, score, box}], ts}` |
+| `GET /faces` | `[{id, name, created_at}]` |
+| `POST /faces` | `{"name", "image"?}` : base64/data URL JPEG ou PNG ; sans `image`, image courante de la caméra |
+| `GET /faces/{id}/image` | vignette JPEG |
+| `DELETE /faces/{id}` | supprime le visage |
+
+L'image doit contenir **exactement un** visage d'au moins 40 px, sinon 422 avec la raison.
+Plusieurs photos sous le même nom améliorent la reconnaissance.
+
+Stockage : `FACES_DIR` (`/data/faces`, volume `faces-data` dans la pile) — `faces.json`
+(empreintes) et une vignette par visage. Ce sont des **données biométriques** (RGPD, art. 9) :
+le volume reste sur la machine, seules les vignettes sortent par l'API.
+
+En autonome (`make up`), l'API est publiée sur `127.0.0.1:8090` :
+
+```bash
+curl -s localhost:8090/status
+curl -s -X POST localhost:8090/faces -d '{"name":"Alice"}'        # visage devant la caméra
+curl -s -X POST localhost:8090/faces \
+  -d "{\"name\":\"Alice\",\"image\":\"$(base64 < alice.jpg)\"}"
+curl -s -X DELETE localhost:8090/faces/<id>
+```
+
 ## Réglages
 
 Capture (`host/capture.py`) :
@@ -256,6 +315,16 @@ avec `-e` ou `environment:` :
 | `MQTT_DEVICE_ID` | `esp01` | `device_id` du topic : celui de l'ESP de la même pièce |
 | `MQTT_TOPIC` | `sentinelx/{device_id}/camera` | motif du topic |
 | `MQTT_INTERVAL` | `1.0` | publication au moins toutes les N s, même sans changement |
+| `FACE_ENABLED` | `1` | `0` désactive la reconnaissance faciale |
+| `FACE_MATCH_THRESHOLD` | `0.363` | similarité cosinus minimale pour reconnaître un visage autorisé |
+| `FACE_DETECT_CONF` | `0.8` | confiance minimale de YuNet pour un visage |
+| `FACE_MIN_SIZE` | `40` | taille minimale (px) d'un visage exploitable |
+| `FACE_HOLD_S` | `5` | une personne de dos reste `authorized` pendant N s |
+| `UNKNOWN_FRAMES` | `3` | images d'un visage inconnu avant de quitter `authorized` |
+| `NONE_HOLD_S` | `1.5` | délai sans personne avant `none` |
+| `FACES_API_PORT` | `8090` | API interne des visages (`0` = désactivée) |
+| `VISION_API_KEY` | vide | Bearer exigé par l'API interne (vide = ouverte, dev uniquement) |
+| `FACES_DIR` | `/data/faces` | visages autorisés (monter un volume sur `/data`) |
 | `TZ` | `Europe/Paris` | fuseau des horodatages console |
 
 Changer `YOLO_MODEL` pour un modèle absent de l'image demande un rebuild
@@ -269,10 +338,13 @@ sur `sentinelx/{MQTT_DEVICE_ID}/camera` au format du contrat du service de déte
 (`backend-iot-alerts/detection-service/docs/MQTT_CONTRACT.md`) :
 
 ```json
-{"ts": 1728136800150, "person": true}
+{"ts": 1728136800150, "person": true, "identity": "authorized", "names": ["Alice"]}
 ```
 
-- publication **immédiate à chaque changement**, et au moins une fois par `MQTT_INTERVAL`
+`identity` et `names` (reconnaissance faciale) sont ignorés par le service de détection, qui
+n'exploite que `person` ; ils servent aux autres abonnés.
+
+- publication **immédiate à chaque changement** (de `person` ou d'identité), et au moins une fois par `MQTT_INTERVAL`
   (1 s) sinon : le service de détection calcule la part de `true` sur 2 s ;
 - seule la classe COCO `person` compte, même si `YOLO_CLASSES` en suit d'autres ;
 - QoS 0, rien n'est mis en file hors connexion (un état périmé ne sert à rien) ; reconnexion

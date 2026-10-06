@@ -16,6 +16,7 @@ http://host.docker.internal:<port>/stream
 import argparse
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -578,6 +579,11 @@ class FfmpegSource:
         proc = self._proc
         if proc and proc.poll() is None:
             proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                # ffmpeg bloque dans la lecture de la webcam ignore SIGTERM
+                proc.kill()
 
 
 def make_handler(source):
@@ -688,6 +694,12 @@ def main():
     except NoUsbCamera as exc:
         print(f"[capture] {exc}", file=sys.stderr)
         return 1
+
+    # SIGTERM (kill, arret du terminal) passe par le meme chemin que Ctrl-C : sinon
+    # ffmpeg survit, orphelin, et garde la webcam ouverte
+    def terminate(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
 
     source = FfmpegSource(args.width, args.height, args.fps, args.quality,
                           args.scale_width)

@@ -3,7 +3,12 @@
 
 Les resultats sont affiches dans la console, et visibles annotes sur
 http://localhost:<PREVIEW_PORT>/ si le port est publie.
+
+Si MQTT_HOST est defini, la presence d'une personne est publiee sur
+sentinelx/{device_id}/camera ({"ts": ms, "person": bool}) a destination du
+service de detection, qui la combine aux capteurs de l'ESP de la meme piece.
 """
+import json
 import os
 import signal
 import sys
@@ -17,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 import numpy as np
+import paho.mqtt.client as mqtt
 from ultralytics import YOLO
 
 STREAM_URL = os.environ.get("STREAM_URL", "http://host.docker.internal:8088/stream")
@@ -31,6 +37,16 @@ MAX_FPS = float(os.environ.get("MAX_FPS", "0"))  # 0 = aussi vite que possible
 PRINT_EMPTY = os.environ.get("PRINT_EMPTY", "0") == "1"
 PREVIEW_PORT = int(os.environ.get("PREVIEW_PORT", "8089"))  # 0 = desactive
 PREVIEW_QUALITY = int(os.environ.get("PREVIEW_QUALITY", "75"))
+
+# Publication MQTT (contrat : backend-iot-alerts/detection-service/docs/MQTT_CONTRACT.md)
+MQTT_HOST = os.environ.get("MQTT_HOST", "").strip()  # vide = desactive
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME") or None
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or None
+MQTT_CA = os.environ.get("MQTT_CA", "").strip()  # defini = TLS (MQTTS)
+MQTT_DEVICE_ID = os.environ.get("MQTT_DEVICE_ID", "esp01")
+MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "sentinelx/{device_id}/camera")
+MQTT_INTERVAL = float(os.environ.get("MQTT_INTERVAL", "1.0"))  # heartbeat, en s
 
 BOUNDARY = "frameboundary"
 
@@ -264,6 +280,74 @@ class Preview:
         return Handler
 
 
+class CameraPublisher:
+    """Publie la presence d'une personne sur sentinelx/{device_id}/camera.
+
+    Le service de detection calcule la part de `true` recus sur 2 s : on publie
+    donc a chaque changement d'etat, et au moins une fois par MQTT_INTERVAL
+    meme sans changement. Le reseau tourne dans le thread de paho, qui se
+    reconnecte seul ; hors connexion les messages sont jetes plutot que mis en
+    file, un etat perime n'ayant aucune valeur pour le service.
+    """
+
+    def __init__(self):
+        self.topic = MQTT_TOPIC.format(device_id=MQTT_DEVICE_ID)
+        self._last_person = None
+        self._last_sent = 0.0
+        self._client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"human-detection-{MQTT_DEVICE_ID}",
+        )
+        if MQTT_USERNAME:
+            self._client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        if MQTT_CA:
+            # verifie la chaine et le nom d'hote : MQTT_HOST doit etre celui du certificat
+            self._client.tls_set(ca_certs=MQTT_CA)
+        self._client.reconnect_delay_set(min_delay=1, max_delay=30)
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+
+    def start(self):
+        scheme = "mqtts" if MQTT_CA else "mqtt"
+        print(f"[mqtt] {scheme}://{MQTT_HOST}:{MQTT_PORT} -> {self.topic}", flush=True)
+        # connect_async : un broker absent au demarrage n'empeche pas la detection
+        self._client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+        self._client.loop_start()
+
+    def stop(self):
+        self._client.disconnect()
+        self._client.loop_stop()
+
+    def _on_connect(self, _client, _userdata, _flags, reason_code, _props):
+        if reason_code.is_failure:
+            print(f"[mqtt] connexion refusee : {reason_code}", flush=True)
+            return
+        print("[mqtt] connecte", flush=True)
+        # republie l'etat courant des la reconnexion
+        self._last_sent = 0.0
+
+    def _on_disconnect(self, _client, _userdata, _flags, reason_code, _props):
+        if not _stop.is_set():
+            print(f"[mqtt] deconnecte ({reason_code}), reconnexion...", flush=True)
+
+    def update(self, person):
+        """A appeler pour chaque image analysee."""
+        now = time.monotonic()
+        changed = person != self._last_person
+        if not changed and now - self._last_sent < MQTT_INTERVAL:
+            return
+        if not self._client.is_connected():
+            return
+        payload = json.dumps({"ts": int(time.time() * 1000), "person": person})
+        info = self._client.publish(self.topic, payload, qos=0)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            return
+        if changed:
+            print(f"[mqtt] person={'true' if person else 'false'}", flush=True)
+        self._last_person = person
+        self._last_sent = now
+
+
 PAGE = b"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -304,6 +388,12 @@ def main():
 
     preview = Preview(PREVIEW_PORT)
     preview.start()
+
+    publisher = CameraPublisher() if MQTT_HOST else None
+    if publisher:
+        publisher.start()
+    else:
+        print("[mqtt] MQTT_HOST vide : publication desactivee", flush=True)
 
     reader = MjpegReader(STREAM_URL)
     reader.start()
@@ -348,6 +438,10 @@ def main():
         counts = Counter(names[int(c)] for c in boxes.cls.tolist()) if len(boxes) else Counter()
         stamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S.%f")[:-3]
 
+        if publisher:
+            # seule la classe person compte, meme si YOLO_CLASSES en suit d'autres
+            publisher.update("person" in counts)
+
         if counts:
             summary = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
             print(f"{stamp} | {infer_ms:6.1f} ms | {summary}", flush=True)
@@ -360,9 +454,6 @@ def main():
                     f"box=({x1},{y1})-({x2},{y2})",
                     flush=True,
                 )
-
-            # TODO: Envoyer une notification au backend qu'une présence à été détéctée.
-            
         elif PRINT_EMPTY:
             print(f"{stamp} | {infer_ms:6.1f} ms | rien detecte", flush=True)
 
@@ -380,6 +471,8 @@ def main():
             window_start = time.monotonic()
 
     preview.stop()
+    if publisher:
+        publisher.stop()
     print("[detect] arret", flush=True)
     return 0
 

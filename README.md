@@ -1,7 +1,8 @@
 # human-detection-ia
 
 Détection de personnes en continu sur le flux d'une **webcam USB**, via YOLO (Ultralytics) dans un
-conteneur Docker. Les résultats s'affichent dans la console.
+conteneur Docker. Les résultats s'affichent dans la console et, si un broker est configuré, la
+présence d'une personne est publiée en MQTT pour le service de détection Sentinel-X.
 
 Seule une webcam USB est utilisable : aucune autre source vidéo n'est acceptée, et si la webcam
 n'est pas branchée la capture s'arrête au lieu de se rabattre sur autre chose. La sélection se
@@ -202,16 +203,57 @@ avec `-e` ou `environment:` :
 | `PRINT_EMPTY` | `0` | `1` affiche aussi les images sans détection |
 | `PREVIEW_PORT` | `8089` | port du flux annoté (`0` désactive) |
 | `PREVIEW_QUALITY` | `75` | qualité JPEG du flux annoté |
+| `MQTT_HOST` | vide | broker MQTT ; vide = pas de publication |
+| `MQTT_PORT` | `8883` | port du broker |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | — | compte MQTT (`vision` dans la pile Sentinel-X) |
+| `MQTT_CA` | vide | CA du broker ; défini = TLS, nom d'hôte vérifié |
+| `MQTT_DEVICE_ID` | `esp01` | `device_id` du topic : celui de l'ESP de la même pièce |
+| `MQTT_TOPIC` | `sentinelx/{device_id}/camera` | motif du topic |
+| `MQTT_INTERVAL` | `1.0` | publication au moins toutes les N s, même sans changement |
 | `TZ` | `Europe/Paris` | fuseau des horodatages console |
 
 Changer `YOLO_MODEL` pour un modèle absent de l'image demande un rebuild
 (`docker build --build-arg YOLO_MODEL=yolo11s.pt -t human-detection-ia/detector ./detector`),
 sinon les poids sont téléchargés au démarrage du conteneur.
 
+## Publication MQTT
+
+Avec `MQTT_HOST` défini, chaque image analysée met à jour l'état « personne présente », publié
+sur `sentinelx/{MQTT_DEVICE_ID}/camera` au format du contrat du service de détection
+(`backend-iot-alerts/detection-service/docs/MQTT_CONTRACT.md`) :
+
+```json
+{"ts": 1728136800150, "person": true}
+```
+
+- publication **immédiate à chaque changement**, et au moins une fois par `MQTT_INTERVAL`
+  (1 s) sinon : le service de détection calcule la part de `true` sur 2 s ;
+- seule la classe COCO `person` compte, même si `YOLO_CLASSES` en suit d'autres ;
+- QoS 0, rien n'est mis en file hors connexion (un état périmé ne sert à rien) ; reconnexion
+  automatique, et un broker absent au démarrage ne bloque pas la détection ;
+- flux webcam coupé = plus de publication : le service garde la dernière valeur `CAMERA_HOLD_S`
+  (5 s) puis la considère absente.
+
+Console :
+
+```
+[mqtt] mqtts://mqtt.sentinel.lan:8883 -> sentinelx/esp01/camera
+[mqtt] connecte
+[mqtt] person=true
+```
+
+Vérifier côté broker (compte ayant le droit de lecture, ex. `iot-backend`) :
+
+```bash
+mosquitto_sub -h mqtt.sentinel.lan -p 8883 --cafile ca.crt -u iot-backend -P '…' \
+  -t 'sentinelx/+/camera' -v
+```
+
 ## Intégration dans un compose parent
 
-Ce dépôt ne fournit qu'un `Dockerfile`. Fragment à reprendre dans le `docker-compose.yml` du dépôt
-parent — en ajustant `context` au chemin réel de ce dépôt :
+Ce dépôt ne fournit qu'un `Dockerfile`. Le dépôt parent `main` l'intègre déjà (service
+`human-detection`, compte MQTT `vision`). Fragment minimal pour un autre compose — en ajustant
+`context` au chemin réel de ce dépôt :
 
 ```yaml
 services:
@@ -233,6 +275,13 @@ services:
       MAX_FPS: "0"
       PRINT_EMPTY: "0"
       TZ: Europe/Paris
+      MQTT_HOST: mqtt.sentinel.lan   # vide = pas de publication
+      MQTT_USERNAME: vision
+      MQTT_PASSWORD: ${MQTT_VISION_PASSWORD}
+      MQTT_CA: /certs/ca.crt
+      MQTT_DEVICE_ID: esp01
+    volumes:
+      - ./ca.crt:/certs/ca.crt:ro
     ports:
       - "8089:8089"          # flux annoté : http://localhost:8089/
     extra_hosts:
@@ -261,5 +310,5 @@ c'est elle qui tient le périphérique USB.
 
 ## Suite possible
 
-Exposer les détections ailleurs que dans la console : JSON sur stdout, publication MQTT/HTTP,
-enregistrement d'événements, alerte à l'entrée d'une personne dans le champ.
+Enregistrer des événements (images au moment d'une détection), suivre plusieurs caméras par
+pièce.

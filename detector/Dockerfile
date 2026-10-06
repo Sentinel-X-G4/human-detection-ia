@@ -1,4 +1,5 @@
-# Detecteur YOLO autonome : lit un flux MJPEG et affiche les detections en console.
+# Detecteur YOLO autonome : lit un flux MJPEG, affiche les detections en console
+# et publie la presence d'une personne en MQTT (si MQTT_HOST est defini).
 # Le compose vit dans le depot parent ; cette image se lance aussi telle quelle.
 FROM python:3.12-slim
 
@@ -29,6 +30,8 @@ RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_MODEL}')" \
 #   MAX_FPS      limite la cadence d'analyse (0 = au maximum)
 #   PRINT_EMPTY  1 pour afficher aussi les images sans detection
 #   PREVIEW_PORT port du flux annote, a publier avec -p (0 = desactive)
+#   MQTT_HOST    broker de la presence (vide = pas de publication) ; MQTT_USERNAME,
+#                MQTT_PASSWORD et MQTT_CA (TLS) sont a fournir au lancement
 ENV STREAM_URL=http://host.docker.internal:8088/stream \
     YOLO_MODEL=${YOLO_MODEL} \
     YOLO_CONF=0.35 \
@@ -39,6 +42,11 @@ ENV STREAM_URL=http://host.docker.internal:8088/stream \
     PRINT_EMPTY=0 \
     PREVIEW_PORT=8089 \
     PREVIEW_QUALITY=75 \
+    MQTT_HOST= \
+    MQTT_PORT=8883 \
+    MQTT_DEVICE_ID=esp01 \
+    MQTT_TOPIC=sentinelx/{device_id}/camera \
+    MQTT_INTERVAL=1.0 \
     TZ=Europe/Paris
 
 EXPOSE 8089

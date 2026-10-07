@@ -9,8 +9,9 @@ d'identite vaut "none" (personne), "authorized" (personne autorisee) ou "unknown
 (inconnu). Les visages autorises se gerent par l'API interne (FACES_API_PORT).
 
 Si MQTT_HOST est defini, la presence et l'identite sont publiees sur
-sentinelx/{device_id}/camera ({"ts", "person", "identity", "names"}) a destination
-du service de detection, qui combine `person` aux capteurs de l'ESP de la piece.
+sentinelx/{device_id}/camera ({"ts", "person", "identity", "names", "faces"}) a destination
+du service de detection, qui combine `person` aux capteurs de l'ESP de la piece et
+enregistre le reste comme dernier etat de la camera (lu par backend-api).
 """
 import json
 import os
@@ -338,14 +339,16 @@ class CameraPublisher:
         if not _stop.is_set():
             print(f"[mqtt] deconnecte ({reason_code}), reconnexion...", flush=True)
 
-    def update(self, person, identity=None, names=()):
+    def update(self, person, identity=None, names=(), faces=()):
         """A appeler pour chaque image analysee.
 
-        `identity` et `names` sont des champs supplementaires, ignores par le
-        service de detection (qui n'exploite que `person`).
+        `identity`, `names` et `faces` (visages vus : nom ou None, sans boite ni score)
+        sont enregistres par le service de detection comme dernier etat de la camera
+        (lu par backend-api pour le dashboard) ; seul `person` entre dans le modele.
         """
         now = time.monotonic()
-        state = (person, identity, tuple(names))
+        faces = tuple(face["name"] for face in faces)
+        state = (person, identity, tuple(names), faces)
         changed = state != self._last_state
         if not changed and now - self._last_sent < MQTT_INTERVAL:
             return
@@ -353,7 +356,7 @@ class CameraPublisher:
             return
         message = {"ts": int(time.time() * 1000), "person": person}
         if identity is not None:
-            message.update(identity=identity, names=list(names))
+            message.update(identity=identity, names=list(names), faces=[{"name": n} for n in faces])
         info = self._client.publish(self.topic, json.dumps(message), qos=0)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             return
@@ -489,7 +492,7 @@ def main():
             # seule la classe person compte, meme si YOLO_CLASSES en suit d'autres
             if tracker:
                 state = tracker.status()
-                publisher.update("person" in counts, state["identity"], state["names"])
+                publisher.update("person" in counts, state["identity"], state["names"], state["faces"])
             else:
                 publisher.update("person" in counts)
 

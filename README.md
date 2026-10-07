@@ -338,13 +338,14 @@ sur `sentinelx/{MQTT_DEVICE_ID}/camera` au format du contrat du service de déte
 (`backend-iot-alerts/detection-service/docs/MQTT_CONTRACT.md`) :
 
 ```json
-{"ts": 1728136800150, "person": true, "identity": "authorized", "names": ["Alice"]}
+{"ts": 1728136800150, "person": true, "identity": "authorized", "names": ["Alice"], "faces": [{"name": "Alice"}, {"name": null}]}
 ```
 
-`identity` et `names` (reconnaissance faciale) sont ignorés par le service de détection, qui
-n'exploite que `person` ; ils servent aux autres abonnés.
+Le service de détection n'exploite que `person` pour son modèle, et enregistre `identity`, `names`
+et `faces` (visages vus : nom ou `null`, sans boîte ni score) comme dernier état de la caméra
+(`detection.camera_state`), lu par backend-api pour le dashboard.
 
-- publication **immédiate à chaque changement** (de `person` ou d'identité), et au moins une fois par `MQTT_INTERVAL`
+- publication **immédiate à chaque changement** (de `person`, d'identité ou des visages vus), et au moins une fois par `MQTT_INTERVAL`
   (1 s) sinon : le service de détection calcule la part de `true` sur 2 s ;
 - seule la classe COCO `person` compte, même si `YOLO_CLASSES` en suit d'autres ;
 - QoS 0, rien n'est mis en file hors connexion (un état périmé ne sert à rien) ; reconnexion
